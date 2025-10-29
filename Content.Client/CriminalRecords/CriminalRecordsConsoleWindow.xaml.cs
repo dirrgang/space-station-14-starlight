@@ -13,10 +13,12 @@ using Robust.Client.UserInterface.XAML;
 using Robust.Shared.Prototypes;
 using Robust.Shared.Random;
 using Robust.Shared.Utility;
+using System;
 using System.Linq;
 using System.Numerics;
 using Content.Shared.StatusIcon;
 using Robust.Client.GameObjects;
+using Timer = Robust.Shared.Timing.Timer;
 
 namespace Content.Client.CriminalRecords;
 
@@ -48,6 +50,10 @@ public sealed partial class CriminalRecordsConsoleWindow : FancyWindow
     private bool _access;
     private uint? _selectedKey;
     private CriminalRecord? _selectedRecord;
+    // Prevent feedback loops when the list is repopulated from server state.
+    private bool _suppressSelectionSignals;
+    // Tracks delayed deselection handling so we can cancel it if a new selection arrives.
+    private bool _pendingDeselection;
 
     private DialogWindow? _reasonDialog;
 
@@ -94,6 +100,11 @@ public sealed partial class CriminalRecordsConsoleWindow : FancyWindow
 
         RecordListing.OnItemSelected += args =>
         {
+            if (_suppressSelectionSignals)
+                return;
+
+            _pendingDeselection = false;
+
             if (RecordListing[args.ItemIndex].Metadata is not uint cast)
                 return;
 
@@ -102,7 +113,24 @@ public sealed partial class CriminalRecordsConsoleWindow : FancyWindow
 
         RecordListing.OnItemDeselected += _ =>
         {
-            OnKeySelected?.Invoke(null);
+            if (_suppressSelectionSignals)
+                return;
+
+            _pendingDeselection = true;
+
+            // Defer clearing so a selection re-applied later in the same frame does not get cancelled.
+            Timer.Spawn(TimeSpan.Zero, () =>
+            {
+                if (_suppressSelectionSignals || !_pendingDeselection)
+                    return;
+
+                _pendingDeselection = false;
+
+                if (RecordListing.GetSelected().Any())
+                    return;
+
+                OnKeySelected?.Invoke(null);
+            });
         };
 
         FilterType.OnItemSelected += eventArgs =>
@@ -176,7 +204,10 @@ public sealed partial class CriminalRecordsConsoleWindow : FancyWindow
         FilterType.SelectId((int)_currentFilterType);
         CrewListFilter.SelectId((int)_currentCrewListFilter);
         NoRecords.Visible = state.RecordListing == null || state.RecordListing.Count == 0;
+        _suppressSelectionSignals = true;
         PopulateRecordListing(state.RecordListing);
+        _suppressSelectionSignals = false;
+        SyncRecordSelection();
 
         // set up the selected person's record
         var selected = _selectedKey != null;
@@ -211,13 +242,15 @@ public sealed partial class CriminalRecordsConsoleWindow : FancyWindow
             RecordListing.Clear();
             return;
         }
-
-        var entries = listing.Select(i => new ItemList.Item(RecordListing) {
+        var entries = listing
+            .Select(i => new ItemList.Item(RecordListing)
+            {
                 Text = i.Value,
                 Metadata = i.Key
-        }).ToList();
-        entries.Sort((a, b) => string.Compare(a.Text, b.Text, StringComparison.Ordinal));
-        RecordListing.SetItems(entries, (a,b) => string.Compare(a.Text, b.Text));
+            })
+            .ToList();
+        entries.Sort(CompareRecordItems);
+        RecordListing.SetItems(entries, CompareRecordItems);
     }
 
     private void PopulateRecordContainer(GeneralStationRecord stationRecord, CriminalRecord criminalRecord)
@@ -345,5 +378,61 @@ public sealed partial class CriminalRecordsConsoleWindow : FancyWindow
         }
 
         return result;
+    }
+
+    private void SyncRecordSelection()
+    {
+        _pendingDeselection = false;
+
+        _suppressSelectionSignals = true;
+        try
+        {
+            if (_selectedKey is null)
+            {
+                RecordListing.ClearSelected();
+                return;
+            }
+
+            var found = false;
+            for (var i = 0; i < RecordListing.Count; i++)
+            {
+                var item = RecordListing[i];
+                var match = item.Metadata is uint key && key == _selectedKey;
+                item.Selected = match;
+                if (match)
+                    found = true;
+            }
+
+            if (!found)
+                RecordListing.ClearSelected();
+        }
+        finally
+        {
+            _suppressSelectionSignals = false;
+        }
+    }
+
+    private static int CompareRecordItems(ItemList.Item a, ItemList.Item b)
+    {
+        // Stable ordering so duplicate display names never collapse onto the same row.
+        var textA = a.Text ?? string.Empty;
+        var textB = b.Text ?? string.Empty;
+        var cmp = string.Compare(textA, textB, StringComparison.Ordinal);
+        if (cmp != 0)
+            return cmp;
+
+        var keyA = a.Metadata as uint?;
+        var keyB = b.Metadata as uint?;
+
+        if (keyA.HasValue && keyB.HasValue)
+            return keyA.Value.CompareTo(keyB.Value);
+
+        if (keyA.HasValue)
+            return 1;
+
+        if (keyB.HasValue)
+            return -1;
+
+        return 0;
     }
 }
